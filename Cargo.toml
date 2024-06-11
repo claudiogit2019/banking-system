@@ -1,0 +1,13 @@
+[package]
+name = "banking-system"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.6", features = ["derive"], git = "https://github.com/clap-rs/clap" }
+clap_derive = "4.5.5"
+rand = "0.8.5"
+rusqlite = { version = "0.26.1", features = ["bundled"] }
+
+
+
