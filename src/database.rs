@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Unlicense
 
 use std::path::PathBuf;
-
 use crate::luhn::AccountNumber;
-
 use rand::prelude::*;
 use rusqlite::{Connection, Result};
 
@@ -15,23 +13,25 @@ pub struct Account {
     pub pin: String,
 }
 
+#[cfg(not(test))]
 fn database_path() -> PathBuf {
     PathBuf::from("bank.s3db")
 }
 
+#[cfg(test)]
+fn database_path() -> PathBuf {
+    PathBuf::from("mock_bank.s3db")
+}
+
 pub fn initialise_bankdb() -> Result<Connection> {
     let db = Connection::open(database_path())?;
-
     let command = "CREATE TABLE IF NOT EXISTS account(
 id INTEGER PRIMARY KEY,
 account_number TEXT,
 pin TEXT DEFAULT '000000',
 balance INTEGER DEFAULT 0
-)
-";
-
-db.execute(command, rusqlite::params![])?;
-
+)";
+    db.execute(command, rusqlite::params![])?;
     Ok(db)
 }
 
@@ -86,7 +86,7 @@ pub fn create_account(data: &AccountNumber, balance: u64) -> Result<()> {
             new_account.balance,
         ],
     )?;
-    
+
     Ok(())
 }
 
@@ -106,7 +106,6 @@ pub fn deposit(amount: &str, pin: &str, account_number: &str) -> Result<()> {
             "UPDATE account SET balance = balance + ?1 WHERE account_number=?2",
             rusqlite::params![amount, account_number],
         )?;
-        
 
         let query_string = format!(
             "SELECT balance FROM account where account_number='{}';",
@@ -128,128 +127,77 @@ pub fn deposit(amount: &str, pin: &str, account_number: &str) -> Result<()> {
 pub fn transfer(
     amount: &str,
     pin: &str,
-    account_number1: &str,
-    account_number2: &str,
-) -> Result<()> {
-    if *account_number1 == *account_number2 {
-        eprintln!("Cannot perform a transfer to the same account!");
-        return Ok(());
-    };
+    origin_account: &str,
+    target_account: &str,
+) -> Result<(Account, Account)> {
+    if *origin_account == *target_account {
+        return Err(rusqlite::Error::QueryReturnedNoRows); // Makes sense. We haven't returned any.
+    }
 
-    let db = initialise_bankdb()?;
-    let query_string = format!(
-        "SELECT pin FROM account where account_number='{}';",
-        account_number1
-    );
+    // Create new binding
+    let origin_account = fetch_account(origin_account)?;
+    let target_account = fetch_account(target_account)?;
 
-    let pin_from_db: String = db.query_row(&query_string, [], |row| row.get(0))?;
+    let correct_pin = origin_account.pin == pin;
 
-    let correct_pin = { pin_from_db == pin };
     if correct_pin {
-        let query_string = format!(
-            "SELECT balance FROM account where account_number='{}';",
-            account_number1
-        );
-
-        let amount_from_db: usize = db.query_row(&query_string, [], |row| row.get(0))?;
-
-        println!(
-            "The account number `{}` has a balance of `{}`.\n",
-            &account_number1, &amount_from_db
-        );
-
         let amount = amount
-            .parse::<usize>()
-            .expect("Not able to parse string to usize");
+            .parse::<u64>().map_err(|_| {
+                rusqlite::Error::QueryReturnedNoRows
+            })?;
 
-        if amount > amount_from_db {
-            eprintln!(
-                "You are trying to transfer that exceeds your current balance... aborting...\n"
-            );
+        if amount > origin_account.balance {
         } else {
+            let db = initialise_bankdb()?;
             // Add money to account 2
             db.execute(
                 "UPDATE account SET balance = balance + ?1 WHERE account_number=?2",
-                rusqlite::params![amount, account_number2],
+                rusqlite::params![amount as i64, &target_account.account_number],
             )?;
             
-
-            // Subtract money from account 1
             db.execute(
                 "UPDATE account SET balance = balance - ?1 WHERE account_number=?2",
-                rusqlite::params![amount, account_number1],
+                rusqlite::params![amount as i64, &origin_account.account_number],
             )?;
             
-
-            let query_string = format!(
-                "SELECT balance FROM account where account_number='{}';",
-                account_number1
-            );
-
-            let amount_from_db: usize = db.query_row(&query_string, [], |row| row.get(0))?;
-
-            println!(
-                "The account number `{}` now has a balance of `{}`.\n",
-                &account_number1, &amount_from_db
-            );
         };
     } else {
-        eprintln!("Wrong pin. Try again...");
+        return Err(rusqlite::Error::QueryReturnedNoRows);
     }
-    Ok(())
+
+    let origin_account = fetch_account(&origin_account.account_number)?;
+    let target_account = fetch_account(&target_account.account_number)?;
+
+    Ok((origin_account, target_account))
 }
 
 pub fn withdraw(amount: &str, pin: &str, account_number: &str) -> Result<()> {
     let db = initialise_bankdb()?;
     let query_string = format!(
-        "SELECT pin FROM account where account_number='{}';",
+        "SELECT pin, balance FROM account WHERE account_number='{}';",
         account_number
     );
 
-    let pin_from_db: String = db.query_row(&query_string, [], |row| row.get(0))?;
+    let (pin_from_db, balance_from_db): (String, u64) = db.query_row(&query_string, [], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
 
-    let correct_pin = { pin_from_db == pin };
-
-    if correct_pin {
-        let query_string = format!(
-            "SELECT balance FROM account where account_number='{}';",
-            account_number
-        );
-
-        let amount_from_db: usize = db.query_row(&query_string, [], |row| row.get(0))?;
-
-        println!(
-            "The account number `{}` has a balance of `{}`.\n",
-            &account_number, &amount_from_db
-        );
-
-        let amount = amount
-            .parse::<usize>()
-            .expect("Not able to parse string to usize");
-
-        if amount > amount_from_db {
-            eprintln!(
-                "You are trying to withdraw that exceeds your current deposit... aborting...\n"
-            );
-        } else {
+    if pin_from_db == pin {
+        let amount = amount.parse::<u64>().map_err(|_| rusqlite::Error::InvalidParameterName("Invalid amount".into()))?;
+        if balance_from_db >= amount {
             db.execute(
                 "UPDATE account SET balance = balance - ?1 WHERE account_number=?2",
                 rusqlite::params![amount, account_number],
             )?;
-            
-
-            let query_string = format!(
-                "SELECT balance FROM account where account_number='{}';",
-                account_number
-            );
-
-            let amount_from_db: usize = db.query_row(&query_string, [], |row| row.get(0))?;
 
             println!(
                 "The account number `{}` now has a balance of `{}`.\n",
-                &account_number, &amount_from_db
+                account_number,
+                balance_from_db - amount
             );
-        };
+        } else {
+            eprintln!("Insufficient funds.");
+        }
     } else {
         eprintln!("Wrong pin. Try again...");
     }
@@ -271,7 +219,7 @@ pub fn delete_account(account_number: &str, pin: &str) -> Result<()> {
             "DELETE FROM account WHERE account_number=?1",
             rusqlite::params![account_number],
         )?;
-        
+
         println!("DELETED ACCOUNT: {}", &account_number);
     } else {
         eprintln!("Wrong pin. Try again...");
@@ -293,4 +241,64 @@ pub fn show_balance(account_number: &str) -> Result<()> {
         &account_number, &amount_from_db
     );
     Ok(())
+}
+
+fn fetch_account(account: &str) -> Result<Account> {
+    let db = initialise_bankdb()?;
+    let mut stmt = db.prepare("SELECT id, account_number, balance, pin FROM account")?;
+    let accounts = stmt.query_map([], |row| {
+        Ok(Account {
+            id: row.get(0)?,
+            account_number: row.get(1)?,
+            balance: row.get(2)?,
+            pin: row.get(3)?,
+        })
+    })?;
+
+    let accounts = accounts.flatten().find(|acc| acc.account_number == account);
+    if let Some(fetched_account) = accounts {
+        Ok(fetched_account)
+    } else {
+        Err(rusqlite::Error::QueryReturnedNoRows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn created_account_is_correct_fetched_from_db() -> Result<()> {
+        let account_number = AccountNumber::new(10);
+        create_account(&account_number, 100)?;
+        let account = fetch_account(&account_number.to_string())?;
+
+        assert_eq!(account.account_number, account_number.to_string());
+        assert_eq!(account.balance, 100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn transferred_balance_is_correct() -> Result<()> {
+        let origin_account_number = AccountNumber::new(10);
+        let target_account_number = AccountNumber::new(10);
+
+        create_account(&origin_account_number, 10000)?;
+        create_account(&target_account_number, 0)?;
+
+        let origin_account = fetch_account(&origin_account_number.to_string())?;
+        let target_account = fetch_account(&target_account_number.to_string())?;
+
+        let pin = origin_account.pin.clone();
+        transfer("10000", &pin, &origin_account.account_number, &target_account.account_number)?;
+
+        let origin_account = fetch_account(&origin_account.account_number)?;
+        let target_account = fetch_account(&target_account.account_number)?;
+
+        assert_eq!(origin_account.balance, 0);
+        assert_eq!(target_account.balance, 10000);
+
+        Ok(())
+    }
 }
